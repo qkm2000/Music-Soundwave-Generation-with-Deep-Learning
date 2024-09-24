@@ -18,4 +18,5 @@ scikit-learn==1.5.2
 scipy==1.14.1
 six==1.16.0
 transformers==4.44.2
+torchvision==0.19.1+cu124
 tzdata==2024.1
