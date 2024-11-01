@@ -45,8 +45,9 @@ def generate_pseudoword(
 def evaluate_pseudoword(
     pseudoword,
     bouba_kiki_value,
-    sound_dict
+    filename='sound_mappings.json'
 ):
+    sound_dict = load_sound_mappings(filename)
     total_bouba_kiki_value = 0
     for char in pseudoword:
         if char in sound_dict["vowels"]:
@@ -89,7 +90,6 @@ if __name__ == "__main__":
     num_tests = 10
     num_polylines = [random.randint(1, 1000) for _ in range(num_tests)]
     bouba_kiki_value = [random.random() for _ in range(num_tests)]
-    sound_dict = load_sound_mappings(filename)
     scores = []
     accumulated_error = 0
 
@@ -102,7 +102,7 @@ if __name__ == "__main__":
         score, error = evaluate_pseudoword(
             pseudoword,
             bouba_kiki_value[i],
-            sound_dict
+            filename
         )
         scores.append(score)
         print(f"Lines: {num_polylines[i]:>4}", end=" | ")
