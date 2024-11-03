@@ -2,7 +2,7 @@ import numpy as np
 import cv2
 
 
-def process_image(filepath, threshold1=100, threshold2=250):
+def process_image(filepath, threshold1=50, threshold2=150):
     """
     Takes an image filepath, converts it to black and white,
     detects and links edges, and returns x and y coordinates
@@ -42,7 +42,6 @@ def process_image(filepath, threshold1=100, threshold2=250):
             y_coords.append(y)
 
     return np.array(x_coords), np.array(y_coords)
-
 
 
 def calculate_weighted_angles_by_edge_length(x_values, y_values):

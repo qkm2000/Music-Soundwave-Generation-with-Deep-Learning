@@ -11,9 +11,9 @@ def load_sound_mappings(filename):
 
 
 def get_syllable_count(num_polylines):
-    if num_polylines < 200:
+    if num_polylines < 1500:
         return 2
-    elif num_polylines <= 500:
+    elif num_polylines <= 6000:
         return 3
     else:
         return 4
@@ -64,9 +64,11 @@ def evaluate_pseudoword(
 def pseudoword_generator(
     bouba_kiki_value,
     num_polylines,
-    filename='sound_mappings.json'
+    filename='sound_mappings.json',
+    sound_dict=None
 ):
-    sound_dict = load_sound_mappings(filename)
+    if sound_dict is None:
+        sound_dict = load_sound_mappings(filename)
     num_syllables = get_syllable_count(num_polylines)
     selected_consonants = select_sounds(
         bouba_kiki_value,
