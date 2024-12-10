@@ -147,6 +147,7 @@ def train_multimodal_earcon_model(
     train_dataloader,
     val_dataloader,
     optimizer,
+    scheduler=None,
     epochs=10,
     patience=3,
     device='cuda' if torch.cuda.is_available() else 'cpu',
@@ -198,6 +199,9 @@ def train_multimodal_earcon_model(
                 image_tag=image_tag
             )
 
+            # print(f"target shape = {target_earcon_features.shape}")
+            # print(f"_ shape = {_.shape}")
+
             # Backpropagate
             loss.backward()
             optimizer.step()
@@ -241,10 +245,20 @@ def train_multimodal_earcon_model(
 
         avg_val_loss = val_loss / val_batches
 
+        # Update learning rate scheduler
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                # For ReduceLROnPlateau, pass validation loss
+                scheduler.step(avg_val_loss)
+            else:
+                # For other schedulers like StepLR, CosineAnnealingLR
+                scheduler.step()
+
         # Print epoch summary
         print(f"Epoch {epoch+1}/{epochs}", end=", ")
         print(f"Training Loss: {avg_train_loss:.4f}", end=", ")
-        print(f"Validation Loss: {avg_val_loss:.4f}")
+        print(f"Validation Loss: {avg_val_loss:.4f}", end=", ")
+        print(f"Learning Rate: {optimizer.param_groups[0]['lr']}")
 
         # Check for early stopping
         if avg_val_loss < best_val_loss:

@@ -30,53 +30,29 @@ class MultimodalEarconGenerator(nn.Module):
         self.musicgen = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small")
         self.processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
 
-        # Freeze MusicGen decoder parameters if specified
-        if freeze_musicgen_decoder:
-            for param in self.musicgen.decoder.parameters():
-                param.requires_grad = False
-
-        # Freeze Musicgen text encoder
-        if freeze_musicgen_text_encoder:
-            for param in self.musicgen.text_encoder.parameters():
-                param.requires_grad = False
-
-        # Freeze Musicgen audio encoder
-        for param in self.musicgen.audio_encoder.parameters():
-            param.requires_grad = False
-
-        # Freeze Encodec parameters if specified
-        if freeze_encodec:
-            for param in self.encodec.parameters():
-                param.requires_grad = False
+        # freeze model parameters if needed
+        self._freeze_model_parameters(
+            freeze_musicgen_decoder,
+            freeze_musicgen_text_encoder,
+            freeze_encodec
+        )
 
         # Dynamic image vector projection with multiple layers
-        image_layers = []
-        current_dim = image_features_dim
-        for _ in range(num_projection_layers - 1):
-            image_layers.extend([
-                nn.Linear(current_dim, current_dim * 2),
-                nn.ReLU(),
-                nn.BatchNorm1d(current_dim * 2)
-            ])
-            current_dim *= 2
+        self.image_projection = self._create_projection_layers(
+            image_features_dim,
+            output_dim=512,
+            num_layers=num_projection_layers
+        )
 
-        image_layers.extend([
-            nn.Linear(current_dim, 512),
-            nn.ReLU(),
-            nn.LayerNorm(512)
-        ])
-
-        self.image_projection = nn.Sequential(*image_layers)
-
-        # Roundness input processing with more complexity
-        roundness_layers = [
+        # Roundness input processing
+        roundness_layers = nn.Sequential(
             nn.Linear(1, 64),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.BatchNorm1d(64),
             nn.Linear(64, 128),
-            nn.ReLU(),
             nn.LayerNorm(128)
-        ]
+        )
+
         self.roundness_projection = nn.Sequential(*roundness_layers)
 
         # Fusion layer with multiple hidden layers
@@ -158,7 +134,7 @@ class MultimodalEarconGenerator(nn.Module):
         # Pass features to MusicGen
         audio_values = self.musicgen.generate(
             **inputs,
-            max_new_tokens=128,
+            max_new_tokens=256,
             do_sample=True,
         )
 
@@ -166,6 +142,7 @@ class MultimodalEarconGenerator(nn.Module):
         if target_earcon_features is not None:
             # Process the audio tensor directly without saving/loading
             waveform = self.process_audio_tensor(audio_values)
+            # print(f"waveform shape = {waveform.shape}")
 
             # Calculate Loss
             loss = self.loss_fn(
@@ -228,6 +205,7 @@ class MultimodalEarconGenerator(nn.Module):
             target_length = 512
             encoded_frames = self.encodec.encode(audio_features)
             compressed_features = encoded_frames[0][0].to(self.device)  # Take the first codebook
+            # print(f"compressed_features shape = {compressed_features.shape}")
 
             # truncate and pad
             length = compressed_features.shape[2]
@@ -241,6 +219,66 @@ class MultimodalEarconGenerator(nn.Module):
             compressed_features = compressed_features.detach().requires_grad_(True)
 
         return compressed_features
+
+    def _create_projection_layers(self, input_dim, output_dim, num_layers):
+        """Create projection layers with residual connections"""
+        layers = []
+        current_dim = input_dim
+
+        for _ in range(num_layers - 1):
+            next_dim = min(current_dim * 2, output_dim)
+            block = nn.Sequential(
+                nn.Linear(current_dim, next_dim),
+                nn.SiLU(),
+                nn.BatchNorm1d(next_dim)
+            )
+
+            # Residual connection if dimensions match
+            if current_dim == next_dim:
+                layers.append(ResidualBlock(block))
+            else:
+                layers.append(block)
+
+            current_dim = next_dim
+
+        # Final projection
+        layers.append(nn.Sequential(
+            nn.Linear(current_dim, output_dim),
+            nn.LayerNorm(output_dim)
+        ))
+
+        return nn.Sequential(*layers)
+
+    def _freeze_model_parameters(
+        self,
+        freeze_decoder,
+        freeze_text_encoder,
+        freeze_encodec
+    ):
+        """Helper method to freeze model parameters"""
+        if freeze_decoder:
+            for param in self.musicgen.decoder.parameters():
+                param.requires_grad = False
+
+        if freeze_text_encoder:
+            for param in self.musicgen.text_encoder.parameters():
+                param.requires_grad = False
+
+        for param in self.musicgen.audio_encoder.parameters():
+            param.requires_grad = False
+
+        if freeze_encodec:
+            for param in self.encodec.parameters():
+                param.requires_grad = False
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, block):
+        super(ResidualBlock, self).__init__()
+        self.block = block
+
+    def forward(self, x):
+        return x + self.block(x)
 
 
 class LogTransform(nn.Module):
@@ -259,9 +297,6 @@ class LogTransform(nn.Module):
 class MultimodalEarconLoss(nn.Module):
     def __init__(
         self,
-        mse_weight=1.0,
-        spectral_weight=0.5,
-        temporal_weight=0.2,
         sample_rate=24000
     ):
         """
@@ -279,7 +314,7 @@ class MultimodalEarconLoss(nn.Module):
         self.mel_spectrogram = nn.Sequential(
             torchaudio.transforms.MelSpectrogram(
                 sample_rate=sample_rate,
-                n_mels=128,
+                n_mels=64,
                 n_fft=512,
                 hop_length=512
             ),
@@ -306,7 +341,7 @@ class MultimodalEarconLoss(nn.Module):
         target_audio = target_audio.to(torch.float32)
 
         # 1. Mean Squared Error Loss (Time Domain)
-        # mse_loss = F.mse_loss(generated_audio, target_audio)
+        mse_loss = F.mse_loss(generated_audio, target_audio)
 
         # 2. Mel Spectrogram Spectral Loss
         # Compute log mel spectrograms
@@ -321,7 +356,7 @@ class MultimodalEarconLoss(nn.Module):
 
         # 4. Combine losses with learnable weights
         total_loss = (
-            # mse_loss +
+            mse_loss +
             spectral_loss +
             temporal_loss
         )
