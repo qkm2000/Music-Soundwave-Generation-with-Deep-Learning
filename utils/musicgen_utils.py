@@ -3,20 +3,12 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from transformers import T5Tokenizer
 
 
 class EarconDataset(Dataset):
     """
     Custom PyTorch Dataset for Earcon Generation
-
-    Args:
-        dataframe (pd.DataFrame): DataFrame containing:
-            - 'image_features': CLIP image vector (512-dim)
-            - 'earcon_features': Max-pooled audio vector (512-dim)
-            - 'roundness': Numerical representation of pseudoword roundness
     """
-    tokenizer = T5Tokenizer.from_pretrained("t5-small")
 
     def __init__(self, dataframe):
         """
@@ -26,32 +18,29 @@ class EarconDataset(Dataset):
             dataframe (pd.DataFrame): Input dataframe with required columns
         """
         # Validate required columns
-        required_cols = ['image_features',
-                         'earcon_features', 'roundness', 'image_tag']
+        required_cols = ['image_features', 'earcon_features', 'roundness']
         for col in required_cols:
             if col not in dataframe.columns:
                 raise ValueError(f"Missing required column: {col}")
 
-        # Convert to numpy arrays for efficient indexing
+        # Preload all data into memory
         self.image_features = np.stack(dataframe['image_features'].values)
         self.earcon_features = np.stack(dataframe['earcon_features'].values)
         self.roundness_values = dataframe['roundness'].values
-        # Tokenize image tags and obtain input_ids
-        self.image_tag = [
-            self.tokenizer(
-                tag,
-                return_tensors="pt",
-                truncation=True,
-                max_length=10,
-                padding="max_length"
-            )["input_ids"].squeeze(0)
-            for tag in dataframe['image_tag'].values]
 
-        # Compute normalization statistics (optional, but recommended)
+        # Compute normalization statistics and normalize in-place
         self.image_mean = self.image_features.mean(axis=0)
         self.image_std = self.image_features.std(axis=0)
         self.audio_mean = self.earcon_features.mean(axis=0)
         self.audio_std = self.earcon_features.std(axis=0)
+
+        self.image_features = (self.image_features - self.image_mean) / (self.image_std + 1e-7)
+        self.earcon_features = (self.earcon_features - self.audio_mean) / (self.audio_std + 1e-7)
+
+        # Convert everything to PyTorch tensors upfront
+        self.image_features = torch.tensor(self.image_features, dtype=torch.float32)
+        self.earcon_features = torch.tensor(self.earcon_features, dtype=torch.float32)
+        self.roundness_values = torch.tensor(self.roundness_values, dtype=torch.float32)
 
     def __len__(self):
         """
@@ -70,22 +59,10 @@ class EarconDataset(Dataset):
             dict: Dictionary containing normalized image vector, 
                   roundness value, and audio vector
         """
-        # Normalize vectors (optional, but helps with training stability)
-        normalized_image_features = (
-            (self.image_features[idx] - self.image_mean) /
-            (self.image_std + 1e-7)  # Small epsilon to prevent division by zero
-        )
-
-        normalized_earcon_features = (
-            (self.earcon_features[idx] - self.audio_mean) /
-            (self.audio_std + 1e-7)
-        )
-
         return {
-            'image_features': torch.tensor(normalized_image_features, dtype=torch.float32),
-            'roundness': torch.tensor(self.roundness_values[idx], dtype=torch.float32),
-            'earcon_features': torch.tensor(normalized_earcon_features, dtype=torch.float32),
-            'image_tag': torch.tensor(self.image_tag[idx])
+            'image_features': self.image_features[idx],
+            'roundness': self.roundness_values[idx],
+            'earcon_features': self.earcon_features[idx],
         }
 
 
@@ -185,7 +162,6 @@ def train_multimodal_earcon_model(
             # Unpack batch
             image_features = batch['image_features'].to(device)
             roundness_values = batch['roundness'].to(device).unsqueeze(-1)  # Ensure 2D tensor
-            image_tag = batch['image_tag'].to(device)
             target_earcon_features = batch['earcon_features'].to(device)
 
             # Zero gradients
@@ -196,11 +172,7 @@ def train_multimodal_earcon_model(
                 image_features=image_features,
                 roundness_value=roundness_values,
                 target_earcon_features=target_earcon_features,
-                image_tag=image_tag
             )
-
-            # print(f"target shape = {target_earcon_features.shape}")
-            # print(f"_ shape = {_.shape}")
 
             # Backpropagate
             loss.backward()
@@ -235,7 +207,6 @@ def train_multimodal_earcon_model(
                     image_features=image_features,
                     roundness_value=roundness_values,
                     target_earcon_features=target_earcon_features,
-                    image_tag=image_tag
                 )
 
                 # Accumulate loss
@@ -277,7 +248,6 @@ def generate_earcon(
     model,
     image_features,
     roundness_value,
-    image_tag,
     device='cuda' if torch.cuda.is_available() else 'cpu'
 ):
     """
@@ -306,7 +276,6 @@ def generate_earcon(
         generated_audio = model(
             image_features=image_features,
             roundness_value=roundness_value,
-            image_tag=image_tag
         )
 
     return generated_audio

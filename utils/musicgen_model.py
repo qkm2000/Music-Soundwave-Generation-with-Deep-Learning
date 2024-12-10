@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
-from transformers import MusicgenForConditionalGeneration, AutoProcessor, T5Tokenizer
+from transformers import MusicgenDecoderConfig, MusicgenModel
 from encodec import EncodecModel
 
 
@@ -24,11 +24,10 @@ class MultimodalEarconGenerator(nn.Module):
         self.target_length = 512
         self.encodec = EncodecModel.encodec_model_24khz().to(self.device)
         self.loss_fn = MultimodalEarconLoss(sample_rate=self.sample_rate)
-        self.tokenizer = T5Tokenizer.from_pretrained("facebook/musicgen-small")
 
         # Use MusicgenForConditionalGeneration
-        self.musicgen = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small")
-        self.processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
+        config = MusicgenDecoderConfig(num_codebooks=1)
+        self.musicgen = MusicgenModel(config)
 
         # freeze model parameters if needed
         self._freeze_model_parameters(
@@ -74,24 +73,13 @@ class MultimodalEarconGenerator(nn.Module):
 
         self.modality_fusion = nn.Sequential(*fusion_layers)
 
-        # Additional feature extractors for more detailed descriptions
-        self.feature_extractors = nn.ModuleDict({
-            'variance_extractor': nn.Sequential(
-                nn.Linear(512, 256),
-                nn.ReLU(),
-                nn.Linear(256, 64)
-            ),
-            'complexity_extractor': nn.Sequential(
-                nn.Linear(512, 256),
-                nn.ReLU(),
-                nn.Linear(256, 64)
-            )
-        })
+        self.float_to_int_converter = FloatToIntegerLayer(input_dim=512)
+
+        self.musicgen_to_encodec_channels = nn.Linear(1024, 1)
 
     def forward(
         self,
         image_features,
-        image_tag,
         roundness_value,
         target_earcon_features=None
     ):
@@ -100,49 +88,26 @@ class MultimodalEarconGenerator(nn.Module):
         roundness_value = roundness_value.to(self.device)
 
         # Project image vector
-        projected_image = self.image_projection(image_features)
+        projected_image = self.image_projection(image_features.float())
 
         # Project roundness value
-        projected_roundness = self.roundness_projection(roundness_value)
+        projected_roundness = self.roundness_projection(roundness_value.float())
 
         # Fuse modalities
         fused_input = self.modality_fusion(
             torch.cat([projected_image, projected_roundness], dim=-1)
         )
 
-        # Extract additional features
-        variance_features = self.feature_extractors['variance_extractor'](fused_input)
-        complexity_features = self.feature_extractors['complexity_extractor'](fused_input)
-
-        # Prepare text input for MusicGen with more detailed description
-        text_descriptions = self.convert_fused_input_to_description(
-            fused_input,
-            image_tag,
-            roundness_value,
-            variance_features,
-            complexity_features
-        )
-
-        # Prepare inputs for MusicGen with explicit padding and truncation
-        inputs = self.processor(
-            text=text_descriptions,
-            padding=True,
-            truncation=True,
-            return_tensors="pt"
-        ).to(self.device)
-
         # Pass features to MusicGen
-        audio_values = self.musicgen.generate(
-            **inputs,
-            max_new_tokens=256,
-            do_sample=True,
-        )
+        # Convert to int tensor instead of float
+        int_fused_input = self.float_to_int_converter(fused_input)
+        audio_values = self.musicgen.decoder(int_fused_input)["last_hidden_state"]
+        audio_values = self.musicgen_to_encodec_channels(audio_values)
+        audio_values = audio_values.permute(0, 2, 1)
 
         # If training, compute loss
         if target_earcon_features is not None:
-            # Process the audio tensor directly without saving/loading
             waveform = self.process_audio_tensor(audio_values)
-            # print(f"waveform shape = {waveform.shape}")
 
             # Calculate Loss
             loss = self.loss_fn(
@@ -153,40 +118,6 @@ class MultimodalEarconGenerator(nn.Module):
             return loss, audio_values
 
         return audio_values
-
-    def convert_fused_input_to_description(
-        self,
-        fused_input,
-        image_tag,
-        roundness_value,
-        variance_features,
-        complexity_features
-    ):
-        """
-        Convert the fused input tensor to a more detailed text description
-        """
-        descriptions = []
-        for i in range(fused_input.shape[0]):
-            # Create a more descriptive text based on the fused input and extracted features
-            mean_val = fused_input[i].mean().item()
-
-            # Interpret additional extracted features
-            variance_val = torch.norm(variance_features[i]).item()
-            complexity_val = torch.norm(complexity_features[i]).item()
-
-            # Generate a more nuanced description
-            description = (
-                f"A very short distinctive sound (earcon) that is: "
-                f"minimal in length, "
-                f"with intensity level {mean_val:.2f}, "
-                f"variation {variance_val:.2f}, "
-                f"complexity {complexity_val:.2f}, "
-                f"roundness {roundness_value[i].item()}, "
-                f"matching the image context '{self.tokenizer.decode(image_tag[i], skip_special_tokens=True)}', "
-            )
-            descriptions.append(description)
-
-        return descriptions
 
     def process_audio_tensor(self, audio_tensor):
         # Ensure the input is a tensor and on the correct device
@@ -260,16 +191,42 @@ class MultimodalEarconGenerator(nn.Module):
             for param in self.musicgen.decoder.parameters():
                 param.requires_grad = False
 
-        if freeze_text_encoder:
-            for param in self.musicgen.text_encoder.parameters():
-                param.requires_grad = False
+        # if freeze_text_encoder:
+        #     for param in self.musicgen.text_encoder.parameters():
+        #         param.requires_grad = False
 
-        for param in self.musicgen.audio_encoder.parameters():
-            param.requires_grad = False
+        # for param in self.musicgen.audio_encoder.parameters():
+        #     param.requires_grad = False
 
         if freeze_encodec:
             for param in self.encodec.parameters():
                 param.requires_grad = False
+
+
+class FloatToIntegerLayer(nn.Module):
+    def __init__(self, input_dim):
+        super(FloatToIntegerLayer, self).__init__()
+        # Learnable scaling and offset parameters
+        self.scale = nn.Parameter(torch.ones(input_dim))
+        self.offset = nn.Parameter(torch.zeros(input_dim))
+
+    def forward(self, x):
+        # Scale and offset the input
+        scaled_x = x * self.scale + self.offset
+
+        # Round to nearest integer and clamp to ensure valid integer range
+        int_x = torch.clamp(
+            torch.round(scaled_x),
+            min=0,
+            max=self.get_max_vocab_size()
+        )
+
+        return int_x.long()
+
+    def get_max_vocab_size(self):
+        # You might want to adjust this based on your specific use case
+        # This is typically the vocabulary size of your embedding layer
+        return 1024  # Example value, adjust as needed
 
 
 class ResidualBlock(nn.Module):
