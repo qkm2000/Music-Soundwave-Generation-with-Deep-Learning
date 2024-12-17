@@ -1,12 +1,9 @@
-import torch.nn.functional as F
-# import torch.nn as nn
 import torch
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from transformers import T5Tokenizer
 from encodec import EncodecModel
 
@@ -134,30 +131,6 @@ def create_earcon_dataloaders(
     return train_loader, val_loader, test_loader
 
 
-def feature_similarity_loss(generated_features, target_features):
-    """
-    Calculate the feature similarity loss between generated and target earcon features.
-
-    Args:
-        generated_features (torch.Tensor): Features of generated audio 
-        target_features (torch.Tensor): Target earcon features to match
-
-    Returns:
-        torch.Tensor: Cosine similarity loss
-    """
-    # Normalize features
-    generated_norm = F.normalize(generated_features, p=2, dim=-1)
-    target_norm = F.normalize(target_features, p=2, dim=-1)
-
-    # Calculate cosine similarity
-    cosine_similarity = torch.sum(generated_norm * target_norm, dim=-1)
-
-    # Convert to loss (minimizing negative cosine similarity)
-    feature_loss = 1 - cosine_similarity.mean()
-
-    return feature_loss
-
-
 def train_musicgen_model(
     model,
     train_dataloader,
@@ -258,42 +231,24 @@ def train_musicgen_model(
             outputs = model(
                 image_features=image_features,
                 roundness=roundness,
+                labels=target_earcon_features,
             )
-
-            # Extract features from generated audio using Encodec
-            generated_audio = outputs.logits
-            generated_audio_features = encodec_model.encode(generated_audio)[0][0].float()
-            # Pad or truncate the generated_audio_features to length 512
-            if generated_audio_features.shape[-1] < 512:
-                padding = 512 - generated_audio_features.shape[-1]
-                generated_audio_features = F.pad(generated_audio_features, (0, padding))
-            else:
-                generated_audio_features = generated_audio_features[:, :512]
-
-            generated_audio_features.requires_grad = True
-            # Calculate feature similarity loss
-            feature_loss = feature_similarity_loss(
-                generated_audio_features,
-                target_earcon_features
-            )
+            loss = outputs.loss
 
             # Combine losses
-            # loss = feature_loss / accumulation_steps
-            loss = feature_loss
             loss.backward()
-            # for name, param in model.named_parameters():
-            #     if param.grad is None:
-            #         print(f"no grad for {name}")
+            optimizer.step()
 
-            # if (batch_idx + 1) % accumulation_steps == 0:
-            #     optimizer.step()
-            #     optimizer.zero_grad()
+            # for name, param in model.named_parameters():
+            #     if param.grad is not None:
+            #         print(f"Gradient for {name}: {param.grad.abs().mean()}")
+            #     else:
+            #         print(f"NO GRADIENT for {name}")
 
             # train_loss += loss.item() * accumulation_steps
             train_loss += loss.item()
             train_progress.set_postfix({
                 'loss': train_loss / (batch_idx + 1),
-                'feature_loss': feature_loss.item()
             })
 
         # Validation phase (similar structure to training phase)
@@ -314,30 +269,14 @@ def train_musicgen_model(
                 outputs = model(
                     image_features=image_features,
                     roundness=roundness,
+                    labels=target_earcon_features,
                 )
-
-                # Extract features from generated audio using Encodec
-                generated_audio = outputs.logits  # Adjust based on your model's output
-                generated_audio_features = encodec_model.encode(generated_audio)[0][0].float()
-                # Pad or truncate the generated_audio_features to length 512
-                if generated_audio_features.shape[-1] < 512:
-                    padding = 512 - generated_audio_features.shape[-1]
-                    generated_audio_features = F.pad(generated_audio_features, (0, padding))
-                else:
-                    generated_audio_features = generated_audio_features[:, :512]
-
-                # Calculate feature similarity loss
-                feature_loss = feature_similarity_loss(
-                    generated_audio_features,
-                    target_earcon_features
-                )
+                loss = outputs.loss
 
                 # Combine losses
-                val_batch_loss = feature_loss
-                val_loss += val_batch_loss.item()
+                val_loss += loss.item()
                 val_progress.set_postfix({
                     'loss': val_loss,
-                    'feature_loss': feature_loss.item()
                 })
 
         # Normalize losses
@@ -394,30 +333,14 @@ def train_musicgen_model(
                 outputs = model(
                     image_features=image_features,
                     roundness=roundness,
+                    labels=target_earcon_features,
                 )
-
-                # Extract features from generated audio using Encodec
-                generated_audio = outputs.logits  # Adjust based on your model's output
-                generated_audio_features = encodec_model.encode(generated_audio)[0][0].float()
-                # Pad or truncate the generated_audio_features to length 512
-                if generated_audio_features.shape[-1] < 512:
-                    padding = 512 - generated_audio_features.shape[-1]
-                    generated_audio_features = F.pad(generated_audio_features, (0, padding))
-                else:
-                    generated_audio_features = generated_audio_features[:, :512]
-
-                # Calculate feature similarity loss
-                feature_loss = feature_similarity_loss(
-                    generated_audio_features,
-                    target_earcon_features
-                )
+                loss = outputs.loss
 
                 # Combine losses
-                test_batch_loss = feature_loss
-                test_loss += test_batch_loss.item()
+                test_loss += loss.item()
                 test_progress.set_postfix({
                     'loss': test_loss,
-                    'feature_loss': feature_loss.item()
                 })
 
         test_loss /= len(test_dataloader)

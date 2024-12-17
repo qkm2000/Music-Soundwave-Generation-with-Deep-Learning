@@ -1,6 +1,8 @@
+import os
+import copy
 import torch
 import torch.nn as nn
-from torch.nn import CrossEntropyLoss
+import torch.nn.functional as F
 from typing import Optional, Tuple, Union
 from transformers import (
     MusicgenPreTrainedModel,
@@ -8,14 +10,24 @@ from transformers import (
     MusicgenModel,
 )
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+from transformers.generation.streamers import BaseStreamer
+from transformers.generation.configuration_utils import GenerationConfig
+from transformers.generation.logits_process import LogitsProcessorList
+from transformers.generation.stopping_criteria import StoppingCriteriaList
+from encodec import EncodecModel
 
 
 class MusicgenForImageLM(MusicgenPreTrainedModel):
-    def __init__(self, config: MusicgenDecoderConfig):
+    def __init__(self, config: MusicgenDecoderConfig = None):
         super().__init__(config)
 
-        self.model = MusicgenModel(config)
+        if config is None:
+            config = MusicgenDecoderConfig(
+                num_codebooks=1,
+            )
 
+        self.model = MusicgenModel(config)
+        self.encodec = EncodecModel.encodec_model_24khz()
         self.num_codebooks = config.num_codebooks
 
         # Modify the input projection to handle image vector and roundness
@@ -92,31 +104,26 @@ class MusicgenForImageLM(MusicgenPreTrainedModel):
         hidden_states = outputs[0]
 
         # Apply LM heads to hidden states
-        lm_logits = torch.stack([head(hidden_states)
-                                for head in self.lm_heads], dim=1)
-
-        loss = None
-        if labels is not None:
-            # Loss computation similar to the original implementation
-            logits = lm_logits[:, :, -labels.shape[1]:]
-
-            loss_fct = CrossEntropyLoss()
-            loss = torch.zeros([], device=self.device)
-
-            # Mask pad tokens
-            labels = labels.masked_fill(labels == self.config.pad_token_id, -100)
-
-            # Per codebook cross-entropy
-            for codebook in range(self.config.num_codebooks):
-                codebook_logits = logits[:, codebook].contiguous().view(-1, logits.shape[-1])
-                codebook_labels = labels[..., codebook].contiguous().view(-1)
-                loss += loss_fct(codebook_logits, codebook_labels)
-
-            loss = loss / self.config.num_codebooks
+        lm_logits = torch.stack([head(hidden_states) for head in self.lm_heads], dim=1)
 
         # Reshape logits
         lm_logits = lm_logits.reshape(-1, *lm_logits.shape[2:])
         lm_logits = lm_logits.view(lm_logits.size(0), 1, -1)
+
+        # Calculate loss if labels are provided
+        loss = None
+        if labels is not None:
+            # Calculate feature similarity loss
+            generated_audio_features = self.extract_audio_features(lm_logits)
+            feature_loss = self.feature_similarity_loss(
+                generated_audio_features,
+                labels
+            )
+
+            # Calculate cross-entropy loss
+            labels = labels.view(labels.size(0), 1, -1)
+            loss = F.cross_entropy(lm_logits, labels)
+            loss += feature_loss
 
         if not return_dict:
             output = (lm_logits,) + outputs[1:]
@@ -131,9 +138,6 @@ class MusicgenForImageLM(MusicgenPreTrainedModel):
             cross_attentions=outputs.cross_attentions,
         )
 
-    # Most other methods from the original class can remain the same
-    # You may want to modify prepare_inputs_for_generation and generate methods
-    # to handle the new input format (image vector and roundness)
     def prepare_inputs_for_generation(
         self,
         input_ids,
@@ -153,12 +157,34 @@ class MusicgenForImageLM(MusicgenPreTrainedModel):
 
         return base_kwargs
 
+    @torch.no_grad()
     def generate(
         self,
         image_features: Optional[torch.Tensor] = None,
         roundness: Optional[torch.Tensor] = None,
-        **kwargs
+        generation_config: Optional[GenerationConfig] = None,
+        logits_processor: Optional[LogitsProcessorList] = None,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
+        synced_gpus: Optional[bool] = None,
+        streamer: Optional["BaseStreamer"] = None,
+        **kwargs,
     ):
+        """
+        Generates audio sequences based on image features and roundness.
+
+        Parameters:
+            image_features (torch.Tensor, optional): Image features used for conditioning
+            roundness (torch.Tensor, optional): Roundness values for conditioning
+            generation_config (GenerationConfig, optional): Configuration for generation
+            logits_processor (LogitsProcessorList, optional): Custom logits processors
+            stopping_criteria (StoppingCriteriaList, optional): Custom stopping criteria
+            synced_gpus (bool, optional): Whether to synchronize GPUs
+            streamer (BaseStreamer, optional): Streamer for generated sequences
+            **kwargs: Additional generation parameters
+
+        Returns:
+            Generated audio sequence
+        """
         # Validate input
         if image_features is None or roundness is None:
             raise ValueError(
@@ -170,24 +196,341 @@ class MusicgenForImageLM(MusicgenPreTrainedModel):
         if roundness.dim() == 0:
             roundness = roundness.unsqueeze(0)
 
+        # 1. Handle `generation_config` and kwargs that might update it, and validate the resulting objects
+        if generation_config is None:
+            generation_config = self.generation_config
+
+        generation_config = copy.deepcopy(generation_config)
+        # All unused kwargs must be model kwargs
+        model_kwargs = generation_config.update(**kwargs)
+        generation_config.validate()
+        self._validate_model_kwargs(model_kwargs.copy())
+
+        # 2. Set generation parameters if not already defined
+        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
+        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+
+        # 3. Prepare inputs
         # Project image vector and roundness
-        projected_input = self.image_projection(
-            torch.cat([image_features, roundness], dim=1))
+        combined_input = torch.cat([image_features, roundness], dim=1)
+        projected_input = self.image_projection(combined_input)
 
-        # Initialize input_ids if not provided
-        inputs = kwargs.get('inputs')
-        if inputs is None:
-            inputs = torch.full(
-                (image_features.size(0), 1),
-                self.generation_config.bos_token_id,
-                dtype=torch.long,
-                device=image_features.device
-            )
+        # Initialize input_ids with start tokens
+        input_ids = torch.full(
+            (projected_input.size(0), 8),
+            generation_config.bos_token_id,
+            dtype=torch.long,
+            device=projected_input.device
+        )
 
-        # Call the parent generate method with modified inputs
-        kwargs['encoder_hidden_states'] = projected_input.unsqueeze(1)
-        kwargs['encoder_attention_mask'] = torch.ones_like(
-            inputs, dtype=torch.long)
-        kwargs['inputs'] = inputs
+        batch_size = input_ids.shape[0]
 
-        return super().generate(**kwargs)
+        # Prepare special tokens and model kwargs
+        self._prepare_special_tokens(
+            generation_config, False, device=input_ids.device)
+        model_kwargs = {
+            "use_cache": generation_config.use_cache,
+            "guidance_scale": generation_config.guidance_scale,
+            "encoder_hidden_states": projected_input.unsqueeze(1),
+            "encoder_attention_mask": torch.ones_like(input_ids, dtype=torch.long)
+        }
+
+        # 4. Prepare inputs for generation
+        input_ids, model_input_name, model_kwargs = self._prepare_model_inputs(
+            input_ids, generation_config.bos_token_id, model_kwargs
+        )
+
+        # Build the delay pattern mask for multi-codebook generation
+        input_ids, delay_pattern_mask = self.build_delay_pattern_mask(
+            input_ids,
+            pad_token_id=generation_config._decoder_start_token_tensor,
+            max_length=generation_config.max_length,
+        )
+
+        if streamer is not None:
+            streamer.put(input_ids.cpu())
+
+        # Stash the delay mask
+        model_kwargs["delay_pattern_mask"] = delay_pattern_mask
+
+        # 5. Prepare logits processor
+        logits_processor = self._get_logits_processor(
+            generation_config=generation_config,
+            input_ids_seq_length=input_ids.shape[-1],
+            encoder_input_ids=input_ids,
+            prefix_allowed_tokens_fn=None,
+            logits_processor=logits_processor,
+            device=input_ids.device,
+        )
+
+        # 6. Prepare stopping criteria
+        stopping_criteria = self._get_stopping_criteria(
+            generation_config=generation_config, stopping_criteria=stopping_criteria
+        )
+
+        # 7. Prepare logits warper for sampling
+        prepared_logits_warper = (
+            self._get_logits_warper(generation_config, device=input_ids.device)
+            if generation_config.do_sample
+            else None
+        )
+
+        # Expand inputs for multiple return sequences
+        input_ids, model_kwargs = self._expand_inputs_for_generation(
+            input_ids=input_ids,
+            expand_size=generation_config.num_return_sequences,
+            **model_kwargs,
+        )
+
+        # 8. Run generation (sampling)
+        outputs = self._sample(
+            input_ids,
+            logits_processor=logits_processor,
+            logits_warper=prepared_logits_warper,
+            stopping_criteria=stopping_criteria,
+            generation_config=generation_config,
+            synced_gpus=synced_gpus,
+            streamer=streamer,
+            **model_kwargs,
+        )
+
+        # 9. Process outputs
+        if generation_config.return_dict_in_generate:
+            output_ids = outputs.sequences
+        else:
+            output_ids = outputs
+
+        # Apply the pattern mask to the final ids
+        output_ids = self.apply_delay_pattern_mask(
+            output_ids, model_kwargs["delay_pattern_mask"])
+
+        # Revert the pattern delay mask by filtering the pad token id
+        output_ids = output_ids[output_ids != generation_config._pad_token_tensor].reshape(
+            batch_size, self.num_codebooks, -1
+        )
+
+        if generation_config.return_dict_in_generate:
+            outputs.sequences = output_ids
+            return outputs
+        else:
+            return output_ids
+
+    def feature_similarity_loss(self, generated_features, target_features):
+        """
+        Calculate the feature similarity loss between generated and target earcon features.
+
+        Args:
+            generated_features (torch.Tensor): Features of generated audio 
+            target_features (torch.Tensor): Target earcon features to match
+
+        Returns:
+            torch.Tensor: Cosine similarity loss
+        """
+        # Ensure all tensors require gradients
+        generated_features = generated_features.requires_grad_(True)
+        target_features = target_features.requires_grad_(True)
+
+        # Normalize features
+        generated_norm = F.normalize(generated_features, p=2, dim=-1)
+        target_norm = F.normalize(target_features, p=2, dim=-1)
+
+        # Calculate cosine similarity
+        cosine_similarity = torch.sum(generated_norm * target_norm, dim=-1)
+
+        # Convert to loss (minimizing negative cosine similarity)
+        feature_loss = 1 - cosine_similarity.mean()
+
+        return feature_loss
+
+    def extract_audio_features(self, generated_audio, length=512):
+        """
+        Extract and preprocess audio features from generated audio.
+
+        Args:
+            generated_audio (torch.Tensor): Generated audio logits
+
+        Returns:
+            torch.Tensor: Processed audio features
+        """
+        # Encode audio using Encodec model
+        generated_audio_features = self.encodec.encode(generated_audio)[0][0].float()
+
+        # Pad or truncate the generated_audio_features to length 512
+        if generated_audio_features.shape[-1] < length:
+            padding = length - generated_audio_features.shape[-1]
+            generated_audio_features = F.pad(generated_audio_features, (0, padding))
+        else:
+            generated_audio_features = generated_audio_features[:, :length]
+
+        generated_audio_features = generated_audio_features.requires_grad_(True)
+        return generated_audio_features
+
+    def build_delay_pattern_mask(self, input_ids: torch.LongTensor, pad_token_id: int, max_length: int = None):
+        """Build a delayed pattern mask to the input_ids. Each codebook is offset by the previous codebook by
+        one, giving a delayed pattern mask at the start of sequence and end of sequence. Take the example where there
+        are 4 codebooks and a max sequence length of 8, we have the delayed pattern mask of shape `(codebooks,
+        seq_len)`:
+        - [P, -1, -1, -1, -1, P, P, P]
+        - [P, P, -1, -1, -1, -1, P, P]
+        - [P, P, P, -1, -1, -1, -1, P]
+        - [P, P, P, P, -1, -1, -1, -1]
+        where P is the special padding token id and -1 indicates that the token is valid for prediction. If we include
+        a prompt (decoder input ids), the -1 positions indicate where new tokens should be predicted. Otherwise, the
+        mask is set to the value in the prompt:
+        - [P, a, b, -1, -1, P, P, P]
+        - [P, P, c, d, -1, -1, P, P]
+        - [P, P, P, e, f, -1, -1, P]
+        - [P, P, P, P, g, h, -1, -1]
+        where a-h indicate the input prompt (decoder input ids) that are offset by 1. Now, we only override the -1
+        tokens in our prediction.
+        """
+        # (bsz * num_codebooks, seq_len) -> (bsz, num_codebooks, seq_len)
+        input_ids = input_ids.reshape(-1,
+                                      self.num_codebooks, input_ids.shape[-1])
+        bsz, num_codebooks, seq_len = input_ids.shape
+
+        max_length = max_length if max_length is not None else self.generation_config.max_length
+        input_ids_shifted = (
+            torch.ones((bsz, num_codebooks, max_length),
+                       dtype=torch.long, device=input_ids.device) * -1
+        )
+
+        channel_codebooks = num_codebooks // 2 if self.config.audio_channels == 2 else num_codebooks
+        # we only apply the mask if we have a large enough seq len - otherwise we return as is
+        if max_length < 2 * channel_codebooks - 1:
+            return input_ids.reshape(bsz * num_codebooks, -1), input_ids_shifted.reshape(bsz * num_codebooks, -1)
+
+        # fill the shifted ids with the prompt entries, offset by the codebook idx
+        for codebook in range(channel_codebooks):
+            if self.config.audio_channels == 1:
+                # mono channel - loop over the codebooks one-by-one
+                input_ids_shifted[:, codebook, codebook: seq_len +
+                                  codebook] = input_ids[:, codebook]
+            else:
+                # left/right channels are interleaved in the generated codebooks, so handle one then the other
+                input_ids_shifted[:, 2 * codebook, codebook: seq_len +
+                                  codebook] = input_ids[:, 2 * codebook]
+                input_ids_shifted[:, 2 * codebook + 1, codebook: seq_len +
+                                  codebook] = input_ids[:, 2 * codebook + 1]
+
+        # construct a pattern mask that indicates the positions of padding tokens for each codebook
+        # first fill the upper triangular part (the EOS padding)
+        delay_pattern = torch.triu(
+            torch.ones((channel_codebooks, max_length), dtype=torch.bool), diagonal=max_length - channel_codebooks + 1
+        )
+        # then fill the lower triangular part (the BOS padding)
+        delay_pattern = delay_pattern + \
+            torch.tril(torch.ones(
+                (channel_codebooks, max_length), dtype=torch.bool))
+
+        if self.config.audio_channels == 2:
+            # for left/right channel we need to duplicate every row of the pattern mask in an interleaved fashion
+            delay_pattern = delay_pattern.repeat_interleave(2, dim=0)
+
+        mask = ~delay_pattern.to(input_ids.device)
+        input_ids = mask * input_ids_shifted + ~mask * pad_token_id
+
+        # find the first position to start generating - this is the first place we have the -1 token
+        # and will always be in the first codebook (since it has no codebook offset)
+        first_codebook_ids = input_ids[:, 0, :]
+        start_ids = (first_codebook_ids == -1).nonzero()[:, 1]
+        if len(start_ids) > 0:
+            first_start_id = min(start_ids)
+        else:
+            # we have no tokens that need to be filled - return entire matrix of input ids
+            first_start_id = seq_len
+
+        # (bsz * num_codebooks, seq_len) -> (bsz, num_codebooks, seq_len)
+        pattern_mask = input_ids.reshape(bsz * num_codebooks, -1)
+        input_ids = input_ids[..., :first_start_id].reshape(
+            bsz * num_codebooks, -1)
+        return input_ids, pattern_mask
+
+    @staticmethod
+    def apply_delay_pattern_mask(input_ids, decoder_pad_token_mask):
+        """Apply a delay pattern mask to the decoder input ids, only preserving predictions where
+        the mask is set to -1, and otherwise setting to the value detailed in the mask."""
+        seq_len = input_ids.shape[-1]
+        decoder_pad_token_mask = decoder_pad_token_mask[..., :seq_len]
+        input_ids = torch.where(
+            decoder_pad_token_mask == -1, input_ids, decoder_pad_token_mask)
+        return input_ids
+
+
+def save_musicgen_image_model(model, save_path="outputs/", filename='MusicGenModel_0x.pt'):
+    """
+    Save the MusicgenForImageLM model and its configuration.
+
+    Args:
+        model (MusicgenForImageLM): The model to save
+        save_path (str): Directory path where the model will be saved
+        filename (str, optional): Name of the file to save the model. Defaults to 'musicgen_image_model.pth'
+
+    Returns:
+        str: Full path to the saved model file
+    """
+    if not filename.endswith('.pt'):
+        filename += '.pt'
+
+    # Ensure the save directory exists
+    os.makedirs(save_path, exist_ok=True)
+
+    # Create the full file path
+    full_path = os.path.join(save_path, filename)
+
+    # Prepare a dictionary with model state and configuration
+    save_dict = {
+        'model_state_dict': model.state_dict(),
+        'config': model.config.to_dict(),
+    }
+
+    # Save the model
+    torch.save(save_dict, full_path)
+
+    print(f"Model saved to {full_path}")
+    return full_path
+
+
+def load_musicgen_image_model(
+    load_path="outputs/",
+    filename='MusicGenModel_0x.pt'
+):
+    """
+    Load a previously saved MusicgenForImageLM model.
+
+    Args:
+        model_class (type): The model class used to instantiate the model (MusicgenForImageLM)
+        load_path (str): Directory path where the model is saved
+        filename (str, optional): Name of the file to load the model from. Defaults to 'musicgen_image_model.pth'
+
+    Returns:
+        MusicgenForImageLM: Loaded and configured model
+    """
+    if not filename.endswith('.pt'):
+        filename += '.pt'
+
+    # Create the full file path
+    full_path = os.path.join(load_path, filename)
+
+    # Check if the file exists
+    if not os.path.exists(full_path):
+        raise FileNotFoundError(f"Model file not found at {full_path}")
+
+    # Load the saved dictionary
+    save_dict = torch.load(full_path, map_location=torch.device('cpu'))
+
+    # Recreate the model configuration
+    model_config = save_dict['config']
+    model_config = MusicgenDecoderConfig(**model_config)
+
+    # Instantiate a new model with the saved configuration
+    model = MusicgenForImageLM(config=model_config)
+
+    # Load the model's state dictionary
+    model.load_state_dict(save_dict['model_state_dict'])
+
+    # Set the model to evaluation mode
+    model.eval()
+
+    print(f"Model loaded from {full_path}")
+    return model
