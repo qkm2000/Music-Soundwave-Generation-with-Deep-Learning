@@ -48,8 +48,8 @@ class MusicgenForImageLM(MusicgenPreTrainedModel):
 
     def forward(
         self,
-        image_features: torch.FloatTensor,  # Shape: [batch_size, 512]
-        roundness: torch.FloatTensor,     # Shape: [batch_size, 1]
+        image_features: Optional[torch.FloatTensor] = None,  # Shape: [batch_size, 512]
+        roundness: Optional[torch.FloatTensor] = None,     # Shape: [batch_size, 1]
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
@@ -67,6 +67,8 @@ class MusicgenForImageLM(MusicgenPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # Combine image vector and roundness
+        print(image_features)
+        print(roundness)
         combined_input = torch.cat([image_features, roundness], dim=1)
 
         # Project the combined input to the model's hidden size
@@ -141,21 +143,61 @@ class MusicgenForImageLM(MusicgenPreTrainedModel):
     def prepare_inputs_for_generation(
         self,
         input_ids,
+        attention_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        head_mask=None,
+        cross_attn_head_mask=None,
+        past_key_values=None,
+        use_cache=True,
+        delay_pattern_mask=None,
+        guidance_scale=None,
         image_features=None,
         roundness=None,
-        **kwargs
+        **kwargs,
     ):
-        # Modify to incorporate image vector and roundness
-        base_kwargs = super().prepare_inputs_for_generation(input_ids, **kwargs)
+        # First handle delay pattern masking
+        if delay_pattern_mask is None:
+            input_ids, delay_pattern_mask = self.build_delay_pattern_mask(
+                input_ids,
+                pad_token_id=self.generation_config.pad_token_id,
+                max_length=self.generation_config.max_length,
+            )
 
+        # Apply the delay pattern mask
+        input_ids = self.apply_delay_pattern_mask(input_ids, delay_pattern_mask)
+
+        # Process image features if provided
         if image_features is not None:
-            base_kwargs['encoder_hidden_states'] = self.image_projection(
+            encoder_hidden_states = self.image_projection(
                 torch.cat([image_features, roundness], dim=1)
             ).unsqueeze(1)
-            base_kwargs['encoder_attention_mask'] = torch.ones_like(
-                input_ids, dtype=torch.long)
+            encoder_attention_mask = torch.ones_like(input_ids, dtype=torch.long)
 
-        return base_kwargs
+        # Handle classifier free guidance
+        if guidance_scale is not None and guidance_scale > 1:
+            input_ids = input_ids.repeat((2, 1))
+            if attention_mask is not None:
+                attention_mask = attention_mask.repeat((2, 1))
+            if encoder_hidden_states is not None:
+                encoder_hidden_states = encoder_hidden_states.repeat((2, 1, 1))
+            if encoder_attention_mask is not None:
+                encoder_attention_mask = encoder_attention_mask.repeat((2, 1))
+
+        # Handle past key values for efficient generation
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1:]
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "encoder_hidden_states": encoder_hidden_states,
+            "encoder_attention_mask": encoder_attention_mask,
+            "head_mask": head_mask,
+            "cross_attn_head_mask": cross_attn_head_mask,
+            "past_key_values": past_key_values,
+            "use_cache": use_cache,
+        }
 
     @torch.no_grad()
     def generate(
@@ -281,6 +323,9 @@ class MusicgenForImageLM(MusicgenPreTrainedModel):
             expand_size=generation_config.num_return_sequences,
             **model_kwargs,
         )
+        model_kwargs["image_features"] = image_features
+        model_kwargs["roundness"] = roundness
+        print(model_kwargs)
 
         # 8. Run generation (sampling)
         outputs = self._sample(
@@ -385,14 +430,12 @@ class MusicgenForImageLM(MusicgenPreTrainedModel):
         tokens in our prediction.
         """
         # (bsz * num_codebooks, seq_len) -> (bsz, num_codebooks, seq_len)
-        input_ids = input_ids.reshape(-1,
-                                      self.num_codebooks, input_ids.shape[-1])
+        input_ids = input_ids.reshape(-1, self.num_codebooks, input_ids.shape[-1])
         bsz, num_codebooks, seq_len = input_ids.shape
 
         max_length = max_length if max_length is not None else self.generation_config.max_length
         input_ids_shifted = (
-            torch.ones((bsz, num_codebooks, max_length),
-                       dtype=torch.long, device=input_ids.device) * -1
+            torch.ones((bsz, num_codebooks, max_length), dtype=torch.long, device=input_ids.device) * -1
         )
 
         channel_codebooks = num_codebooks // 2 if self.config.audio_channels == 2 else num_codebooks
@@ -404,14 +447,11 @@ class MusicgenForImageLM(MusicgenPreTrainedModel):
         for codebook in range(channel_codebooks):
             if self.config.audio_channels == 1:
                 # mono channel - loop over the codebooks one-by-one
-                input_ids_shifted[:, codebook, codebook: seq_len +
-                                  codebook] = input_ids[:, codebook]
+                input_ids_shifted[:, codebook, codebook: seq_len + codebook] = input_ids[:, codebook]
             else:
                 # left/right channels are interleaved in the generated codebooks, so handle one then the other
-                input_ids_shifted[:, 2 * codebook, codebook: seq_len +
-                                  codebook] = input_ids[:, 2 * codebook]
-                input_ids_shifted[:, 2 * codebook + 1, codebook: seq_len +
-                                  codebook] = input_ids[:, 2 * codebook + 1]
+                input_ids_shifted[:, 2 * codebook, codebook: seq_len + codebook] = input_ids[:, 2 * codebook]
+                input_ids_shifted[:, 2 * codebook + 1, codebook: seq_len + codebook] = input_ids[:, 2 * codebook + 1]
 
         # construct a pattern mask that indicates the positions of padding tokens for each codebook
         # first fill the upper triangular part (the EOS padding)
@@ -420,14 +460,15 @@ class MusicgenForImageLM(MusicgenPreTrainedModel):
         )
         # then fill the lower triangular part (the BOS padding)
         delay_pattern = delay_pattern + \
-            torch.tril(torch.ones(
-                (channel_codebooks, max_length), dtype=torch.bool))
+            torch.tril(torch.ones((channel_codebooks, max_length), dtype=torch.bool))
 
         if self.config.audio_channels == 2:
             # for left/right channel we need to duplicate every row of the pattern mask in an interleaved fashion
             delay_pattern = delay_pattern.repeat_interleave(2, dim=0)
 
         mask = ~delay_pattern.to(input_ids.device)
+        if pad_token_id is None:
+            pad_token_id = 2048
         input_ids = mask * input_ids_shifted + ~mask * pad_token_id
 
         # find the first position to start generating - this is the first place we have the -1 token
@@ -517,7 +558,7 @@ def load_musicgen_image_model(
         raise FileNotFoundError(f"Model file not found at {full_path}")
 
     # Load the saved dictionary
-    save_dict = torch.load(full_path, map_location=torch.device('cpu'))
+    save_dict = torch.load(full_path, map_location=torch.device('cpu'), weights_only=True)
 
     # Recreate the model configuration
     model_config = save_dict['config']
@@ -533,4 +574,4 @@ def load_musicgen_image_model(
     model.eval()
 
     print(f"Model loaded from {full_path}")
-    return model
+    return model.to("cuda" if torch.cuda.is_available() else "cpu")

@@ -239,12 +239,6 @@ def train_musicgen_model(
             loss.backward()
             optimizer.step()
 
-            # for name, param in model.named_parameters():
-            #     if param.grad is not None:
-            #         print(f"Gradient for {name}: {param.grad.abs().mean()}")
-            #     else:
-            #         print(f"NO GRADIENT for {name}")
-
             # train_loss += loss.item() * accumulation_steps
             train_loss += loss.item()
             train_progress.set_postfix({
@@ -256,6 +250,7 @@ def train_musicgen_model(
         val_loss = 0.0
 
         with torch.no_grad():
+            count = 1
             val_progress = tqdm(
                 val_dataloader,
                 desc='Validation',
@@ -276,8 +271,9 @@ def train_musicgen_model(
                 # Combine losses
                 val_loss += loss.item()
                 val_progress.set_postfix({
-                    'loss': val_loss,
+                    'loss': val_loss / count,
                 })
+                count += 1
 
         # Normalize losses
         train_loss /= len(train_dataloader)
