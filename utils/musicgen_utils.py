@@ -133,18 +133,21 @@ def create_earcon_dataloaders(
 
 def train_musicgen_model(
     model,
+    image_processor,
     train_dataloader,
     val_dataloader,
-    encodec_model=None,  # Encodec model for feature extraction
+    encodec_model=None,
     test_dataloader=None,
     epochs=10,
-    learning_rate=1e-4,
-    weight_decay=1e-2,
+    model_learning_rate=1e-4,
+    processor_learning_rate=1e-4,
+    weight_decay=1e-5,
     patience=3,
-    optimizer=None,
-    scheduler=None,
-    device="cuda" if torch.cuda.is_available() else "cpu",
-    accumulation_steps=None,
+    model_optimizer=None,
+    processor_optimizer=None,
+    model_scheduler=None,
+    processor_scheduler=None,
+    device=None,
 ):
     """
     Train the MusicgenForImageLM model with earcon feature matching.
@@ -160,20 +163,19 @@ def train_musicgen_model(
         weight_decay (float, optional): Weight decay for regularization. Defaults to 1e-2.
         patience (int, optional): Patience for early stopping. Defaults to 3.
         device (torch.device, optional): Device to train on. Defaults to cuda if available.
-        accumulation_steps (int, optional): Gradient accumulation steps. Defaults to 1.
         feature_loss_weight (float, optional): Weight for feature similarity loss. Defaults to 1.0.
 
     Returns:
         dict: Training results containing best validation loss and final test metrics
     """
-    # Set up accumulation steps
-    accumulation_steps = max(1, accumulation_steps)
 
     # Set up device
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Set up Encodec model
+    model.to(device)
+    image_processor.to(device)
     if encodec_model is None:
         encodec_model = EncodecModel.encodec_model_24khz().to(device)
 
@@ -182,25 +184,22 @@ def train_musicgen_model(
     encodec_model.to(device)
 
     # Prepare optimizer and scheduler
-    if optimizer is None:
-        optimizer = AdamW(
+    if model_optimizer is None:
+        model_optimizer = AdamW(
             model.parameters(),
-            lr=learning_rate,
+            lr=model_learning_rate,
             weight_decay=weight_decay
         )
-    # if scheduler is None:
-    #     scheduler = ReduceLROnPlateau(
-    #         optimizer,
-    #         mode='min',
-    #         factor=0.5,
-    #         patience=1,
-    #         verbose=True
-    #     )
+    if processor_optimizer is None:
+        processor_optimizer = AdamW(
+            image_processor.parameters(),
+            lr=processor_learning_rate,
+            weight_decay=weight_decay
+        )
 
     # Early stopping setup
     best_val_loss = float('inf')
     epochs_no_improve = 0
-    best_model_state = None
 
     # Training loop
     results = {
@@ -212,13 +211,14 @@ def train_musicgen_model(
     for epoch in range(epochs):
         # Training phase
         model.train()
+        image_processor.train()
         train_loss = 0.0
-        optimizer.zero_grad()
 
         train_progress = tqdm(
             train_dataloader,
             desc=f'Epoch {epoch+1}/{epochs}',
-            unit='batch'
+            unit='batch',
+            leave=True
         )
 
         for batch_idx, batch in enumerate(train_progress):
@@ -227,43 +227,64 @@ def train_musicgen_model(
             roundness = batch['roundness'].to(device)
             target_earcon_features = batch['earcon_features'].to(device)
 
+            processed_images = image_processor(image_features, roundness)
+
+            # print(f"input_ids.requires_grad: {processed_images['input_ids'].requires_grad}")
+            # print(f"attention_mask.requires_grad: {processed_images['attention_mask'].requires_grad}")
+
             # Training step
             outputs = model(
-                image_features=image_features,
-                roundness=roundness,
+                input_ids=processed_images["input_ids"],
+                attention_mask=processed_images["attention_mask"],
                 labels=target_earcon_features,
             )
             loss = outputs.loss
 
-            # Combine losses
+            # Backpropagation
+            model_optimizer.zero_grad()
+            processor_optimizer.zero_grad()
             loss.backward()
-            optimizer.step()
+            model_optimizer.step()
+            processor_optimizer.step()
 
-            # train_loss += loss.item() * accumulation_steps
-            train_loss += loss.item()
+            # check for gradients
+            # for name, param in model.named_parameters():
+            #     if param.requires_grad:
+            #         if param.grad is None:
+            #             print(f"None gradient for {name}")
+            # for name, param in image_processor.named_parameters():
+            #     if param.requires_grad:
+            #         if param.grad is None:
+            #             print(f"None gradient for {name}")
+
+            train_loss = train_loss + loss.item()
             train_progress.set_postfix({
-                'loss': train_loss / (batch_idx + 1),
+                'loss': (train_loss / (batch_idx + 1)),
             })
 
         # Validation phase (similar structure to training phase)
         model.eval()
+        image_processor.eval()
         val_loss = 0.0
 
         with torch.no_grad():
-            count = 1
             val_progress = tqdm(
                 val_dataloader,
                 desc='Validation',
-                unit='batch'
+                unit='batch',
+                leave=True
             )
-            for batch in val_progress:
+            for batch_idx, batch in enumerate(val_progress):
+                # Unpack batch
                 image_features = batch['image_features'].to(device)
                 roundness = batch['roundness'].to(device)
                 target_earcon_features = batch['earcon_features'].to(device)
 
+                processed_images = image_processor(image_features, roundness)
+
                 outputs = model(
-                    image_features=image_features,
-                    roundness=roundness,
+                    input_ids=processed_images["input_ids"],
+                    attention_mask=processed_images["attention_mask"],
                     labels=target_earcon_features,
                 )
                 loss = outputs.loss
@@ -271,9 +292,8 @@ def train_musicgen_model(
                 # Combine losses
                 val_loss += loss.item()
                 val_progress.set_postfix({
-                    'loss': val_loss / count,
+                    'loss': val_loss / (batch_idx + 1),
                 })
-                count += 1
 
         # Normalize losses
         train_loss /= len(train_dataloader)
@@ -282,24 +302,33 @@ def train_musicgen_model(
         # Store results
         results['train_losses'].append(train_loss)
         results['val_losses'].append(val_loss)
-        results['lr_rates'].append(optimizer.param_groups[0]['lr'])
+        results['lr_rates'].append(model_optimizer.param_groups[0]['lr'])
 
         # Learning rate scheduling
-        if scheduler is not None:
-            scheduler.step(val_loss)
+        if model_scheduler is not None:
+            model_scheduler.step(val_loss)
+        if processor_scheduler is not None:
+            processor_scheduler.step(val_loss)
 
         # Early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
-            best_model_state = model.state_dict().copy()
+            best_model_states = {
+                'musicgen': model.state_dict().copy(),
+                'processor': image_processor.state_dict().copy()
+            }
+            print('This is the best model thus far, saving...')
         else:
             epochs_no_improve += 1
 
         # Print epoch summary
-        print(f'Epoch {epoch+1}: Train Loss: {train_loss:.4f}, '
-              f'Val Loss: {val_loss:.4f}, '
-              f'LR: {optimizer.param_groups[0]["lr"]}')
+        print(
+            f'Epoch {epoch+1}: Train Loss: {train_loss:.4f}, '
+            f'Val Loss: {val_loss:.4f}, '
+            f'Mod LR: {model_optimizer.param_groups[0]["lr"]}, '
+            f'Pro LR: {processor_optimizer.param_groups[0]["lr"]}'
+        )
 
         # Early stopping check
         if epochs_no_improve >= patience:
@@ -307,36 +336,40 @@ def train_musicgen_model(
             break
 
     # Restore best model
-    if best_model_state:
-        model.load_state_dict(best_model_state)
+    if best_model_states:
+        model.load_state_dict(best_model_states["musicgen"])
+        image_processor.load_state_dict(best_model_states["processor"])
 
     # Test phase (optional)
     if test_dataloader:
         model.eval()
+        image_processor.eval()
         test_loss = 0.0
 
         with torch.no_grad():
             test_progress = tqdm(
                 test_dataloader,
                 desc='Testing',
-                unit='batch'
+                unit='batch',
+                leave=True
             )
             for batch in test_progress:
                 image_features = batch['image_features'].to(device)
                 roundness = batch['roundness'].to(device)
                 target_earcon_features = batch['earcon_features'].to(device)
 
+                processed_images = image_processor(image_features, roundness)
+
                 outputs = model(
-                    image_features=image_features,
-                    roundness=roundness,
+                    input_ids=processed_images["input_ids"],
+                    attention_mask=processed_images["attention_mask"],
                     labels=target_earcon_features,
                 )
                 loss = outputs.loss
 
-                # Combine losses
                 test_loss += loss.item()
                 test_progress.set_postfix({
-                    'loss': test_loss,
+                    'loss': test_loss / len(test_dataloader),
                 })
 
         test_loss /= len(test_dataloader)
